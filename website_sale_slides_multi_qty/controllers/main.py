@@ -4,8 +4,9 @@ import json
 import re
 
 from dateutil.relativedelta import relativedelta
+from markupsafe import Markup
 
-from odoo import _, fields, http
+from odoo import fields, http, tools
 from odoo.http import request
 from odoo.tools import consteq
 
@@ -16,22 +17,44 @@ class WebsiteSaleSlides(WebsiteSlides):
     def _normalize_identification_number(self, value):
         return re.sub(r"[^0-9A-Z]", "", (value or "").strip().upper())
 
+    def _register_public_participation(self, participation, target_partner):
+        previous_partner = participation.partner_id
+        participation.write(
+            {
+                "partner_id": target_partner.id,
+                "is_public_slide_channel_partner": False,
+            }
+        )
+        slide_partners = (
+            request.env["slide.slide.partner"]
+            .sudo()
+            .search(
+                [
+                    ("channel_id", "=", participation.channel_id.id),
+                    ("partner_id", "=", previous_partner.id),
+                    (
+                        "identification_number",
+                        "=",
+                        participation.identification_number,
+                    ),
+                ]
+            )
+        )
+        slide_partners.write({"partner_id": target_partner.id})
+
     def _set_viewed_slide(self, slide, quiz_attempts_inc=False):
-        identification_number = request.session.get("identification_number", False)
-        if (
-            request.env.user._is_public()
-            and slide.channel_id.is_member
-            and identification_number
-        ):
+        if slide._is_public_with_key():
             slide.action_set_viewed(quiz_attempts_inc=quiz_attempts_inc)
             return True
-        return super()._set_viewed_slide(slide, quiz_attempts_inc=quiz_attempts_inc)
+        return super()._set_viewed_slide(
+            slide,
+            quiz_attempts_inc=quiz_attempts_inc,
+        )
 
     def _get_slide_detail(self, slide):
         values = super()._get_slide_detail(slide)
-        identification_number = request.session.get("identification_number", False)
         # Prevent them from attempting to post comments if they do not have a partner_id
-        if identification_number and "message_post_pid" in values:
+        if slide._is_public_with_key() and "message_post_pid" in values:
             values["message_post_pid"] = False
         return values
 
@@ -81,54 +104,56 @@ class WebsiteSaleSlides(WebsiteSlides):
         return values
 
     def _get_channel_progress(self, channel, include_quiz=False):
-        values = super()._get_channel_progress(channel, include_quiz=include_quiz)
-        identification_number = request.session.get("identification_number", False)
-        if request.website.is_public_user() and identification_number:
-            slides = (
-                request.env["slide.slide"]
-                .sudo()
-                .search([("channel_id", "=", channel.id)])
+        values = super()._get_channel_progress(
+            channel,
+            include_quiz=include_quiz,
+        )
+        if not channel._is_public_with_key():
+            return values
+        slide_partners = (
+            request.env["slide.slide.partner"]
+            .sudo()
+            .search(
+                [
+                    ("channel_id", "=", channel.id),
+                    (
+                        "partner_id",
+                        "=",
+                        int(request.session["invite_partner_id"]),
+                    ),
+                    (
+                        "identification_number",
+                        "=",
+                        request.session["identification_number"],
+                    ),
+                    ("slide_id", "in", list(values)),
+                ]
             )
-            slide_partners = (
-                request.env["slide.slide.partner"]
-                .sudo()
-                .search(
-                    [
-                        ("channel_id", "=", channel.id),
-                        (
-                            "partner_id",
-                            "=",
-                            int(request.session.get("invite_partner_id")),
-                        ),
-                        ("identification_number", "=", identification_number),
-                        ("slide_id", "in", slides.ids),
-                    ]
+        )
+        for slide_partner in slide_partners:
+            slide_id = slide_partner.slide_id.id
+            values[slide_id].update(slide_partner.read()[0])
+            if slide_partner.slide_id.sudo().question_ids:
+                gains = [
+                    slide_partner.slide_id.quiz_first_attempt_reward,
+                    slide_partner.slide_id.quiz_second_attempt_reward,
+                    slide_partner.slide_id.quiz_third_attempt_reward,
+                    slide_partner.slide_id.quiz_fourth_attempt_reward,
+                ]
+                values[slide_id]["quiz_gain"] = (
+                    gains[slide_partner.quiz_attempts_count]
+                    if slide_partner.quiz_attempts_count < len(gains)
+                    else gains[-1]
                 )
-            )
-            for slide_partner in slide_partners:
-                values[slide_partner.slide_id.id].update(slide_partner.read()[0])
-                if slide_partner.slide_id in values:
-                    values[slide_partner.slide_id].update(slide_partner.read()[0])
-                    if slide_partner.slide_id.sudo().question_ids:
-                        gains = [
-                            slide_partner.slide_id.quiz_first_attempt_reward,
-                            slide_partner.slide_id.quiz_second_attempt_reward,
-                            slide_partner.slide_id.quiz_third_attempt_reward,
-                            slide_partner.slide_id.quiz_fourth_attempt_reward,
-                        ]
-                        values[slide_partner.slide_id.id]["quiz_gain"] = (
-                            gains[slide_partner.quiz_attempts_count]
-                            if slide_partner.quiz_attempts_count < len(gains)
-                            else gains[-1]
-                        )
         return values
 
     def _check_identification_number(self, identification_number, partner):
         # Validate ID depending on the country of the parent partner
         if not identification_number or not partner or not partner.sudo().country_id:
             return True  # Allow if insufficient data
-        return request.env["res.partner"].simple_vat_check(
-            partner.country_id.code.upper(), identification_number.strip().upper()
+        return request.env["res.partner"]._check_vat_number(
+            partner.sudo().country_id.code.upper(),
+            identification_number.strip().upper(),
         )
 
     def _session_data(self):
@@ -150,9 +175,15 @@ class WebsiteSaleSlides(WebsiteSlides):
         request.session["invite_partner_id"] = invite_partner_id
         request.session["invite_hash"] = invite_hash
 
-    @http.route("/slides/is_public_with_key", type="json", auth="public", website=True)
-    def session_data(self):
-        return self._session_data()
+    @http.route(
+        "/slides/is_public_with_key",
+        type="jsonrpc",
+        auth="public",
+        website=True,
+    )
+    def is_public_with_key(self):
+        participations = request.env["slide.channel"]._get_public_key_participations()
+        return {"is_public_with_key": bool(participations)}
 
     @http.route()
     def channel(
@@ -169,27 +200,22 @@ class WebsiteSaleSlides(WebsiteSlides):
         search=None,
         **kw,
     ):
+        channel_rec = (
+            channel or request.env["slide.channel"].browse(int(channel_id)).exists()
+        )
         session_data = self._session_data()
-        participation = False
-        if session_data["invite_hash"]:
-            participation = (
-                request.env["slide.channel.partner"]
-                .sudo()
-                .search(
-                    [
-                        ("invitation_hash", "=", session_data["invite_hash"]),
-                        (
-                            "identification_number",
-                            "=",
-                            session_data["identification_number"],
-                        ),
-                        ("channel_id", "=", channel_id),
-                    ],
-                    limit=1,
-                )
+        has_session_data = all(
+            (
+                session_data["identification_number"],
+                session_data["invite_hash"],
+                session_data["invite_partner_id"],
             )
-        if participation and participation.channel_id.id != channel_id:
-            # If there is no valid participation, we delete the session data.
+        )
+        if (
+            has_session_data
+            and not request.env["slide.channel"]._get_public_key_participations()
+        ):
+            # Delete the session only when it no longer identifies a participation.
             self._delete_session_data()
         res = super().channel(
             channel=channel,
@@ -204,18 +230,22 @@ class WebsiteSaleSlides(WebsiteSlides):
             search=search,
             **kw,
         )
-        channel_rec = channel or request.env["slide.channel"].browse(int(channel_id))
+        if not getattr(res, "qcontext", None):
+            return res
         res.qcontext["can_enroll"] = self._can_user_register(
-            (participation.channel_id if participation else channel_rec),
+            channel_rec,
             request.env.user,
         ) or bool(kw.get("is_invite", False))
         channel_error = request.session.pop("channel_error", None)
         if channel_error:
-            res.qcontext["channel_error"] = channel_error
+            res.qcontext["channel_error"] = Markup(channel_error)
         show_modal_to_join = request.session.pop("show_modal_to_join", None)
         if show_modal_to_join:
             res.qcontext["show_modal_to_join"] = show_modal_to_join
-        show_identification_form = request.session.pop("show_identification_form", None)
+        show_identification_form = request.session.pop(
+            "show_identification_form",
+            None,
+        )
         if show_identification_form:
             res.qcontext["show_identification_form"] = show_identification_form
         return res
@@ -230,27 +260,46 @@ class WebsiteSaleSlides(WebsiteSlides):
     def join_with_vat(self, **kwargs):
         # Registered user enters VAT before accessing the course.
         channel_id = int(kwargs.get("channel_id"))
-        invite_partner_id = kwargs.get("invite_partner_id")
+        invite_partner_id = int(kwargs.get("invite_partner_id"))
         invite_hash = kwargs.get("invite_hash")
         redirect_url = (
             f"/slides/{channel_id}"
             f"/invite?invite_partner_id={invite_partner_id}"
             f"&invite_hash={invite_hash}"
         )
-        channel = request.env["slide.channel"].browse(channel_id).exists()
-        if not channel:
-            return self._redirect_to_slides_main("no_channel")
+        invite_values = self._get_channel_values_from_invite(
+            channel_id,
+            invite_hash,
+            invite_partner_id,
+        )
+        if not invite_values.get("invite_preview"):
+            return request.redirect(redirect_url)
+        channel = invite_values["invite_channel"]
         target_partner = request.env.user.partner_id
-        identification_number = kwargs.get("identification_number", False)
-        if not self._check_identification_number(identification_number, target_partner):
-            request.session["channel_error"] = _("Invalid identification number.")
+        identification_number = kwargs.get(
+            "identification_number",
+            False,
+        )
+        if not self._check_identification_number(
+            identification_number,
+            target_partner,
+        ):
+            request.session["channel_error"] = request.env._(
+                "Invalid identification number."
+            )
             return request.redirect(redirect_url)
         identification_number_norm = self._normalize_identification_number(
             identification_number
         )
         existing_enroll = channel.sudo().channel_partner_ids.filtered(
-            lambda r: self._normalize_identification_number(r.identification_number)
-            == identification_number_norm
+            lambda participation: (
+                participation.parent_id
+                and participation.is_public_slide_channel_partner
+                and self._normalize_identification_number(
+                    participation.identification_number
+                )
+                == identification_number_norm
+            )
         )[:1]
         # Save VAT in user contact
         target_partner.sudo().write(
@@ -259,15 +308,17 @@ class WebsiteSaleSlides(WebsiteSlides):
             }
         )
         if existing_enroll:
-            existing_enroll.write(
-                {
-                    "partner_id": target_partner.id,
-                }
+            self._register_public_participation(
+                existing_enroll,
+                target_partner,
             )
+            request.session.pop("show_identification_form", None)
             return request.redirect(f"/slides/{channel_id}")
         request.session.pop("show_identification_form", None)
-        join_url = f"/slides/{channel.id}/join" + (
-            f"?invite_partner_id={invite_partner_id}" if invite_partner_id else ""
+        join_url = (
+            f"/slides/{channel.id}/join"
+            f"?invite_partner_id={invite_partner_id}"
+            f"&invite_hash={invite_hash}"
         )
         return request.redirect(join_url)
 
@@ -279,7 +330,7 @@ class WebsiteSaleSlides(WebsiteSlides):
         website=True,
     )
     def slide_channel_join_with_id(self, **kw):
-        identification_number = kw.get("identification_number", False)
+        identification_number = kw.get("identification_number")
         channel_id = int(kw.get("channel_id"))
         invite_partner_id = int(kw.get("invite_partner_id"))
         invite_hash = kw.get("invite_hash")
@@ -288,49 +339,68 @@ class WebsiteSaleSlides(WebsiteSlides):
             f"/invite?invite_partner_id={invite_partner_id}"
             f"&invite_hash={invite_hash}"
         )
-        channel = request.env["slide.channel"].browse(channel_id).exists()
-        if not channel:
-            return self._redirect_to_slides_main("no_channel")
+        invite_values = self._get_channel_values_from_invite(
+            channel_id,
+            invite_hash,
+            invite_partner_id,
+        )
+        if not invite_values.get("invite_preview"):
+            return request.redirect(redirect_url)
+        channel = invite_values["invite_channel"]
+        target_partner = invite_values["invite_partner"]
+        parent_channel_partner = invite_values["invite_channel_partner"]
         identification_number_norm = self._normalize_identification_number(
             identification_number
         )
-        slide_channel_partner = channel.sudo().channel_partner_ids.filtered(
-            lambda r: self._normalize_identification_number(r.identification_number)
-            == identification_number_norm
-        )[:1]
+
+        def _find_participation():
+            return channel.sudo().channel_partner_ids.filtered(
+                lambda participation: (
+                    participation.parent_id == parent_channel_partner
+                    and self._normalize_identification_number(
+                        participation.identification_number
+                    )
+                    == identification_number_norm
+                )
+            )[:1]
+
+        slide_channel_partner = _find_participation()
         if slide_channel_partner and slide_channel_partner.partner_id.user_ids:
             login_url = f"/web/login?redirect=/slides/{channel_id}"
-            request.session["channel_error"] = (
-                _(
-                    "This identification number is already linked to a registered "
-                    "account. Please <a href='%s'>log in</a> to access the course."
-                )
-                % login_url
+            request.session["channel_error"] = request.env._(
+                "This identification number is already linked to a "
+                "registered account. Please <a href='%s'>log in</a> "
+                "to access the course.",
+                login_url,
             )
             return request.redirect(redirect_url)
-        slide_channel_partner_name = (
-            (kw.get("slide_channel_partner_name") or "").strip().upper()
-        )
-        slide_channel_partner_email = kw.get("slide_channel_partner_email")
-        slide_channel_partner_phone = kw.get("slide_channel_partner_phone")
-        target_partner = request.env["res.partner"].browse(invite_partner_id)
-        parent_channel_partner = channel.sudo().channel_partner_ids.filtered(
-            lambda x: x.sale_order_line_ids and x.invitation_hash == invite_hash
-        )
         if not slide_channel_partner:
+            slide_channel_partner_name = (
+                (kw.get("slide_channel_partner_name") or "").strip().upper()
+            )
+            slide_channel_partner_email = kw.get("slide_channel_partner_email")
+            slide_channel_partner_phone = kw.get("slide_channel_partner_phone")
             if (
                 not slide_channel_partner_name
                 or not slide_channel_partner_email
                 or not slide_channel_partner_phone
             ):
-                request.session["channel_error"] = _(
+                request.session["channel_error"] = request.env._(
                     "There is no participation for this key"
                 )
                 return request.redirect(redirect_url)
             if not self._check_identification_number(
-                identification_number, target_partner
+                identification_number,
+                target_partner,
             ):
-                request.session["channel_error"] = _("Invalid identification number.")
+                request.session["channel_error"] = request.env._(
+                    "Invalid identification number."
+                )
+                return request.redirect(redirect_url)
+            if parent_channel_partner.remaining_registrations <= 0:
+                request.session["channel_error"] = request.env._(
+                    "No registrations available for this course."
+                )
                 return request.redirect(redirect_url)
             self._add_new_member(
                 channel,
@@ -342,7 +412,17 @@ class WebsiteSaleSlides(WebsiteSlides):
                 identification_number=identification_number,
                 is_public_slide_channel_partner=True,
             )
-        self._set_session_data(identification_number, invite_partner_id, invite_hash)
+            slide_channel_partner = _find_participation()
+        if not slide_channel_partner:
+            request.session["channel_error"] = request.env._(
+                "There is no participation for this key"
+            )
+            return request.redirect(redirect_url)
+        self._set_session_data(
+            slide_channel_partner.identification_number,
+            invite_partner_id,
+            invite_hash,
+        )
         return request.redirect(f"/slides/{channel_id}")
 
     @http.route("/slides/<int:channel_id>/join", type="http", auth="user", website=True)
@@ -351,45 +431,82 @@ class WebsiteSaleSlides(WebsiteSlides):
         if not channel:
             return self._redirect_to_slides_main("no_channel")
         target_partner = request.env.user.partner_id
+        channel_partners = channel.sudo().channel_partner_ids
+        # Convert an existing public participation into a registered one.
         if target_partner.vat:
             identification_number_norm = self._normalize_identification_number(
                 target_partner.vat
             )
-            existing_enroll = channel.sudo().channel_partner_ids.filtered(
-                lambda r: self._normalize_identification_number(r.identification_number)
-                == identification_number_norm
-            )[:1]
-            if existing_enroll and existing_enroll.partner_id != target_partner:
-                existing_enroll.write({"partner_id": target_partner.id})
-                return request.redirect(f"/slides/{channel_id}")
-        parent_channel_partners = channel.sudo().channel_partner_ids.filtered(
-            lambda x: x.available_registrations > 1
-        )
-        invite_partner_id = kwargs.get("invite_partner_id", False)
-        for parent_channel_partner in parent_channel_partners:
-            if parent_channel_partner.partner_id == target_partner:
-                self._add_new_member(channel, target_partner, parent_channel_partner)
-            else:
-                if (
-                    parent_channel_partner.partner_id.commercial_partner_id
-                    == target_partner.commercial_partner_id
-                ):
-                    self._add_new_member(
-                        channel, target_partner, parent_channel_partner
+            public_participation = channel_partners.filtered(
+                lambda participation: (
+                    participation.parent_id
+                    and participation.is_public_slide_channel_partner
+                    and self._normalize_identification_number(
+                        participation.identification_number
                     )
-        if invite_partner_id:
-            parent_channel_partner = parent_channel_partners.filtered(
-                lambda x: x.partner_id.id == int(invite_partner_id) and not x.parent_id
+                    == identification_number_norm
+                )
+            )[:1]
+            if public_participation:
+                self._register_public_participation(
+                    public_participation,
+                    target_partner,
+                )
+                return request.redirect(f"/slides/{channel_id}")
+        # Do not consume another registration if the user is already enrolled.
+        existing_participation = channel_partners.filtered(
+            lambda participation: (
+                participation.partner_id == target_partner
+                and not participation.is_public_slide_channel_partner
+                and (
+                    participation.parent_id
+                    or participation._is_individual_course_registration()
+                )
             )
-            self._add_new_member(channel, target_partner, parent_channel_partner)
+        )[:1]
+        if existing_participation:
+            return request.redirect(f"/slides/{channel_id}")
+        invite_partner_id = kwargs.get("invite_partner_id")
+        if invite_partner_id:
+            parent_participation = channel_partners.filtered(
+                lambda participation: (
+                    not participation.parent_id
+                    and participation.partner_id.id == int(invite_partner_id)
+                    and participation.sale_order_line_ids
+                    and participation.remaining_registrations > 0
+                )
+            )[:1]
+        else:
+            # The buyer or one of their contacts can consume a registration.
+            parent_participation = channel_partners.filtered(
+                lambda participation: (
+                    not participation.parent_id
+                    and participation.sale_order_line_ids
+                    and participation.remaining_registrations > 0
+                    and participation.partner_id.commercial_partner_id
+                    == target_partner.commercial_partner_id
+                )
+            )[:1]
+        if parent_participation:
+            self._add_new_member(channel, target_partner, parent_participation)
         return request.redirect(f"/slides/{channel_id}")
 
     @http.route()
     def slide_channel_invite(self, channel_id, invite_partner_id, invite_hash):
         res = super().slide_channel_invite(channel_id, invite_partner_id, invite_hash)
         self._delete_session_data()
+        invite_values = self._get_channel_values_from_invite(
+            int(channel_id),
+            invite_hash,
+            int(invite_partner_id),
+        )
+        if not invite_values.get("invite_preview"):
+            return res
         redirect_url = (
-            f"/slides/{channel_id}?is_invite=1&invite_partner_id={invite_partner_id}"
+            f"/slides/{channel_id}"
+            f"?is_invite=1"
+            f"&invite_partner_id={invite_partner_id}"
+            f"&invite_hash={invite_hash}"
         )
         # No user is logged.
         if request.website.is_public_user():
@@ -397,12 +514,12 @@ class WebsiteSaleSlides(WebsiteSlides):
             request.session["invite_hash"] = invite_hash
             request.session["show_modal_to_join"] = True
             return request.redirect(redirect_url)
-        # A user is logged
-        channel = request.env["slide.channel"].browse(int(channel_id)).exists()
+        channel = invite_values["invite_channel"]
         enroll = channel.sudo().channel_partner_ids.filtered(
-            lambda x: x.partner_id == request.env.user.partner_id
+            lambda participation: participation.partner_id
+            == request.env.user.partner_id
         )
-        if not request.env.user.partner_id.id == int(invite_partner_id) and not enroll:
+        if request.env.user.partner_id.id != int(invite_partner_id) and not enroll:
             if not request.env.user.partner_id.vat:
                 request.session["show_identification_form"] = True
             return request.redirect(redirect_url)
@@ -411,31 +528,46 @@ class WebsiteSaleSlides(WebsiteSlides):
     def _can_user_register(self, channel, user):
         # Check if the user meets the conditions to register for the course.
         partner = user.partner_id
-        enroll = channel.sudo().channel_partner_ids.filtered(
-            lambda x: x.partner_id == partner and not x.is_public_slide_channel_partner
+        channel_partners = channel.sudo().channel_partner_ids
+        already_enrolled = channel_partners.filtered(
+            lambda registration: (
+                registration.partner_id == partner
+                and not registration.is_public_slide_channel_partner
+                and (
+                    registration.parent_id
+                    or registration._is_individual_course_registration()
+                )
+            )
+        )[:1]
+        if already_enrolled:
+            return False
+        partner_registrations = channel_partners.filtered(
+            lambda registration: (
+                registration.partner_id == partner
+                and not registration.parent_id
+                and not registration.is_public_slide_channel_partner
+            )
         )
-        # If the accessing user is the one who has acquired and does not have a
-        # sub-participation
-        if (
-            len(enroll) == 1
-            and enroll.available_registrations > 1
-            and enroll.available_registrations > enroll.used_registrations
+        # The buyer can consume one of the available registrations.
+        if any(
+            registration.available_registrations > 1
+            and registration.remaining_registrations > 0
+            for registration in partner_registrations
         ):
             return True
-        # If the accessing user is a contact of the company or of the partner who has
-        # acquired the shareholding
-        enroll_comercial = channel.sudo().channel_partner_ids.filtered(
-            lambda x: x.partner_id.commercial_partner_id
-            == partner.commercial_partner_id
+        company_registrations = channel_partners.filtered(
+            lambda registration: (
+                not registration.parent_id
+                and registration.sale_order_line_ids
+                and registration.partner_id.commercial_partner_id
+                == partner.commercial_partner_id
+            )
         )
-        enroll_comercial_parent = enroll_comercial.filtered("child_channel_partner_ids")
-        if (
-            partner.id not in enroll_comercial.partner_id.ids
-            and enroll_comercial_parent.available_registrations
-            > enroll_comercial_parent.used_registrations
-        ):
-            return True
-        return False
+        # A contact of the buyer can consume one of the available registrations.
+        return partner not in channel_partners.partner_id and any(
+            registration.remaining_registrations > 0
+            for registration in company_registrations
+        )
 
     def _add_new_member(
         self, channel, target_partner, parent_channel_partner, **kwargs
@@ -478,8 +610,12 @@ class WebsiteSaleSlides(WebsiteSlides):
         # Apply custom logic to consider only participations without a parent_id
         # (main participations).
         channel_partner_sudo = channel_sudo.channel_partner_all_ids.filtered(
-            lambda cp: cp.partner_id.id == invite_partner_id and not cp.parent_id
-        )
+            lambda participation: (
+                participation.partner_id.id == invite_partner_id
+                and not participation.parent_id
+                and participation.active
+            )
+        )[:1]
         if not channel_partner_sudo:
             return {"invite_error": "expired"}
         if not consteq(channel_partner_sudo._get_invitation_hash(), invite_hash):
@@ -503,138 +639,142 @@ class WebsiteSaleSlides(WebsiteSlides):
 
     @http.route()
     def slide_set_completed(self, slide_id):
-        session_data = self._session_data() or {}
-        invite_hash = session_data.get("invite_hash", False)
-        identification_number = session_data.get("identification_number", False)
-        invite_partner_id = session_data.get("invite_partner_id", False)
-        if (
-            request.website.is_public_user()
-            and identification_number
-            and invite_partner_id
-            and invite_hash
-        ):
-            fetch_res = self._fetch_slide(slide_id)
-            if fetch_res.get("error"):
-                return fetch_res
-            self._slide_mark_completed(fetch_res["slide"])
-            next_category = fetch_res["slide"]._get_next_category()
-            return {
-                "channel_completion": fetch_res["slide"].channel_id.completion,
-                "next_category_id": next_category.id if next_category else False,
-            }
-        return super().slide_set_completed(slide_id)
+        if not request.env["slide.channel"]._has_key_session():
+            return super().slide_set_completed(slide_id)
+        fetch_res = self._fetch_slide(slide_id)
+        if fetch_res.get("error"):
+            return fetch_res
+        slide = fetch_res["slide"]
+        if not slide._is_public_with_key():
+            return {"error": "slide_access"}
+        self._slide_mark_completed(slide)
+        next_category = slide._get_next_category()
+        return {
+            "channel_completion": slide.channel_id.completion,
+            "next_category_id": next_category.id if next_category else False,
+        }
+
+    @http.route()
+    def slide_set_uncompleted(self, slide_id):
+        if not request.env["slide.channel"]._has_key_session():
+            return super().slide_set_uncompleted(slide_id)
+        fetch_res = self._fetch_slide(slide_id)
+        if fetch_res.get("error"):
+            return fetch_res
+        slide = fetch_res["slide"]
+        if not slide._is_public_with_key():
+            return {"error": "slide_access"}
+        self._slide_mark_uncompleted(slide)
+        return {
+            "channel_completion": slide.channel_id.completion,
+            "next_category_id": False,
+        }
+
+    @http.route()
+    def slide_like(self, slide_id, upvote):
+        if not request.env["slide.channel"]._has_key_session():
+            return super().slide_like(slide_id, upvote)
+        fetch_res = self._fetch_slide(slide_id)
+        if fetch_res.get("error"):
+            return fetch_res
+        slide = fetch_res["slide"]
+        if not slide._is_public_with_key():
+            return {"error": "slide_access"}
+        if not slide.channel_id.allow_comment:
+            return {"error": "channel_comment_disabled"}
+        if not slide.channel_id.can_vote:
+            return {"error": "channel_karma_required"}
+        if upvote:
+            slide.action_like()
+        else:
+            slide.action_dislike()
+        return {
+            "user_vote": slide.user_vote,
+            "likes": tools.misc.format_decimalized_number(slide.likes),
+            "dislikes": tools.misc.format_decimalized_number(slide.dislikes),
+        }
 
     # QUIZ SECTION
 
     @http.route()
     def slide_quiz_submit(self, slide_id, answer_ids):
-        session_data = self._session_data() or {}
-        invite_hash = session_data.get("invite_hash", False)
-        identification_number = session_data.get("identification_number", False)
-        invite_partner_id = session_data.get("invite_partner_id", False)
-        values = super().slide_quiz_submit(slide_id, answer_ids)
-        if (
-            request.website.is_public_user()
-            and identification_number
-            and invite_partner_id
-            and invite_hash
-        ):
-            values = {}
-            fetch_res = self._fetch_slide(slide_id)
-            if fetch_res.get("error"):
-                return fetch_res
-            slide = fetch_res["slide"]
-            if slide.user_has_completed:
-                self._channel_remove_session_answers(slide.channel_id, slide)
-                return {"error": "slide_quiz_done"}
-            all_questions = (
-                request.env["slide.question"]
-                .sudo()
-                .search([("slide_id", "=", slide.id)])
-            )
-            user_answers = (
-                request.env["slide.answer"].sudo().search([("id", "in", answer_ids)])
-            )
-            if user_answers.mapped("question_id") != all_questions:
-                return {"error": "slide_quiz_incomplete"}
-            user_bad_answers = user_answers.filtered(
-                lambda answer: not answer.is_correct
-            )
-            self._set_viewed_slide(slide, quiz_attempts_inc=True)
-            quiz_info = self._get_slide_quiz_partner_info(slide, quiz_done=True)
-            rank_progress = {}
-            if not user_bad_answers:
-                rank_progress["previous_rank"] = self._get_rank_values(request.env.user)
-                slide._action_mark_completed()
-                rank_progress["new_rank"] = self._get_rank_values(request.env.user)
-                rank_progress.update(
-                    {
-                        "description": request.env.user.rank_id.description,
-                        "last_rank": not request.env.user._get_next_rank(),
-                        "level_up": rank_progress["previous_rank"]["lower_bound"]
-                        != rank_progress["new_rank"]["lower_bound"],
-                    }
-                )
+        if not request.env["slide.channel"]._has_key_session():
+            return super().slide_quiz_submit(slide_id, answer_ids)
+        fetch_res = self._fetch_slide(slide_id)
+        if fetch_res.get("error"):
+            return fetch_res
+        slide = fetch_res["slide"]
+        if not slide._is_public_with_key():
+            return {"error": "slide_access"}
+        if slide.user_has_completed:
             self._channel_remove_session_answers(slide.channel_id, slide)
-            values.update(
+            return {"error": "slide_quiz_done"}
+        all_questions = (
+            request.env["slide.question"].sudo().search([("slide_id", "=", slide.id)])
+        )
+        user_answers = (
+            request.env["slide.answer"].sudo().search([("id", "in", answer_ids)])
+        )
+        if user_answers.mapped("question_id") != all_questions:
+            return {"error": "slide_quiz_incomplete"}
+        user_bad_answers = user_answers.filtered(lambda answer: not answer.is_correct)
+        self._set_viewed_slide(slide, quiz_attempts_inc=True)
+        quiz_info = self._get_slide_quiz_partner_info(
+            slide,
+            quiz_done=True,
+        )
+        rank_progress = {}
+        if not user_bad_answers:
+            rank_progress["previous_rank"] = self._get_rank_values(request.env.user)
+            slide._action_mark_completed()
+            rank_progress["new_rank"] = self._get_rank_values(request.env.user)
+            rank_progress.update(
                 {
-                    "answers": {
-                        answer.question_id.id: {
-                            "is_correct": answer.is_correct,
-                            "comment": answer.comment,
-                        }
-                        for answer in user_answers
-                    },
-                    "completed": slide.user_has_completed,
-                    "channel_completion": slide.channel_id.completion,
-                    "quizKarmaWon": quiz_info["quiz_karma_won"],
-                    "quizKarmaGain": quiz_info["quiz_karma_gain"],
-                    "quizAttemptsCount": quiz_info["quiz_attempts_count"],
-                    "rankProgress": rank_progress,
+                    "description": request.env.user.rank_id.description,
+                    "last_rank": not request.env.user._get_next_rank(),
+                    "level_up": (
+                        rank_progress["previous_rank"]["lower_bound"]
+                        != rank_progress["new_rank"]["lower_bound"]
+                    ),
                 }
             )
-        return values
+        self._channel_remove_session_answers(slide.channel_id, slide)
+        return {
+            "answers": {
+                answer.question_id.id: {
+                    "is_correct": answer.is_correct,
+                    "comment": answer.comment,
+                }
+                for answer in user_answers
+            },
+            "completed": slide.user_has_completed,
+            "channel_completion": slide.channel_id.completion,
+            "quizKarmaWon": quiz_info["quiz_karma_won"],
+            "quizKarmaGain": quiz_info["quiz_karma_gain"],
+            "quizAttemptsCount": quiz_info["quiz_attempts_count"],
+            "rankProgress": rank_progress,
+        }
 
     # PROFILE
 
     def _prepare_user_slides_profile(self, user):
-        invite_hash = request.session.get("invite_hash", False)
-        identification_number = request.session.get("identification_number", False)
-        invite_partner_id = request.session.get("invite_partner_id", False)
         values = super()._prepare_user_slides_profile(user)
-        if (
-            request.website.is_public_user()
-            and identification_number
-            and invite_partner_id
-            and invite_hash
-        ):
-            courses = (
-                request.env["slide.channel.partner"]
-                .sudo()
-                .search(
-                    [
-                        (
-                            "partner_id",
-                            "=",
-                            int(invite_partner_id),
-                            ("identification_number", "=", identification_number),
-                        )
-                    ]
-                )
-            )
-            courses_completed = courses.filtered(
-                lambda c: c.member_status == "completed"
-            )
-            courses_ongoing = courses - courses_completed
-            values.update(
-                {
-                    "uid": request.env.user.id,
-                    "user": user,
-                    "main_object": user,
-                    "courses_completed": courses_completed,
-                    "courses_ongoing": courses_ongoing,
-                    "is_profile_page": True,
-                    "my_profile": True,
-                }
-            )
+        participations = request.env["slide.channel"]._get_public_key_participations()
+        if not participations:
+            return values
+        courses_completed = participations.filtered(
+            lambda participation: participation.member_status == "completed"
+        )
+        courses_ongoing = participations - courses_completed
+        values.update(
+            {
+                "uid": request.env.user.id,
+                "user": user,
+                "main_object": user,
+                "courses_completed": courses_completed,
+                "courses_ongoing": courses_ongoing,
+                "is_profile_page": True,
+                "my_profile": True,
+            }
+        )
         return values

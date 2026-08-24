@@ -11,9 +11,9 @@
         <field name="body_html" type="html">
             <div style="margin: 0px; padding: 0px; font-size: 13px;">
                 <p style="margin: 0px; padding: 0px; font-size: 13px;">
-                    Hello <t t-out="object.partner_id.name " />,
+                    Hello <t t-out="object.partner_id.name" />,
                 </p>
-                <t t-if="object.sale_order_line_ids.product_uom_qty > 1">
+                <t t-if="object.available_registrations > 1">
                     <p style="margin: 0px; padding: 0px; font-size: 13px;">
                         You have successfully acquired <strong>
                         <t t-out="object.available_registrations" />

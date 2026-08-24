@@ -1,6 +1,7 @@
 # Copyright 2025 Tecnativa - Pilar Vargas
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
-from odoo import fields, models
+from odoo import api, fields, models
+from odoo.fields import Domain
 from odoo.http import request
 from odoo.tools import sql
 
@@ -10,79 +11,100 @@ class SlideSlidePartner(models.Model):
 
     identification_number = fields.Char()
 
-    _sql_constraints = [
-        (
-            "slide_partner_uniq",
-            "CHECK (true)",
-            "Constraint disabled: allowing repeated partner on the same slide.",
-        ),
-        (
-            "unique_slide_identification",
-            "unique(slide_id, identification_number)",
-            "The identification number must be unique!",
-        ),
-    ]
+    _slide_partner_uniq = models.Constraint(
+        "CHECK (true)",
+        "Constraint disabled: allowing repeated partner on the same slide.",
+    )
+
+    _unique_slide_identification = models.Constraint(
+        "unique(slide_id, identification_number)",
+        "The identification number must be unique!",
+    )
 
 
 class SlideSlide(models.Model):
     _inherit = "slide.slide"
 
     def _is_public_with_key(self):
-        if request:
-            identification_number = request.session.get("identification_number", False)
-            invite_hash = request.session.get("invite_hash", False)
-            invite_partner_id = request.session.get("invite_partner_id", False)
-            return bool(
-                self.env.user._is_public()
-                and identification_number
-                and invite_hash
-                and invite_partner_id
-            )
-        return False
+        return bool(self) and self.channel_id._is_public_with_key()
 
     def _compute_user_membership_id(self):
         res = super()._compute_user_membership_id()
-        if self._is_public_with_key():
-            slide_partners = (
-                self.env["slide.slide.partner"]
-                .sudo()
-                .search(
-                    [
-                        ("slide_id", "in", self.ids),
-                        (
-                            "partner_id",
-                            "=",
-                            int(request.session.get("invite_partner_id")),
-                        ),
-                        (
-                            "identification_number",
-                            "=",
-                            request.session.get("identification_number"),
-                        ),
-                    ]
-                )
-            )
-            for record in self:
-                record.user_membership_id = next(
+        if not self.channel_id._has_key_session():
+            return res
+        participations = self.channel_id._get_public_key_participations()
+        authorized_slides = self.filtered(
+            lambda slide: slide.channel_id in participations.channel_id
+        )
+        if not authorized_slides:
+            return res
+        slide_partners = (
+            self.env["slide.slide.partner"]
+            .sudo()
+            .search(
+                [
+                    ("slide_id", "in", authorized_slides.ids),
                     (
-                        slide_partner
-                        for slide_partner in slide_partners
-                        if slide_partner.slide_id == record
+                        "partner_id",
+                        "=",
+                        int(request.session["invite_partner_id"]),
                     ),
-                    self.env["slide.slide.partner"],
-                )
-                record.user_vote = record.user_membership_id.vote
+                    (
+                        "identification_number",
+                        "=",
+                        request.session["identification_number"],
+                    ),
+                ]
+            )
+        )
+        memberships_by_slide = {
+            slide_partner.slide_id.id: slide_partner for slide_partner in slide_partners
+        }
+        for slide in authorized_slides:
+            membership = memberships_by_slide.get(
+                slide.id,
+                self.env["slide.slide.partner"],
+            )
+            slide.user_membership_id = membership
+            slide.user_vote = membership.vote
+            slide.user_has_completed = membership.completed
         return res
 
     def _action_vote(self, upvote=True):
-        karma_before = self.env.user.karma
-        res = super()._action_vote(upvote)
-        # If the user is public with password, resets the points to the previous value.
-        if self.env.user._is_public() and any(
-            slide.user_membership_id.identification_number for slide in self
-        ):
-            self.env.user.sudo().write({"karma": karma_before})
-        return res
+        if not self._is_public_with_key():
+            return super()._action_vote(upvote)
+        partner_id = int(request.session["invite_partner_id"])
+        identification_number = request.session["identification_number"]
+        slide_partners = (
+            self.env["slide.slide.partner"]
+            .sudo()
+            .search(
+                [
+                    ("slide_id", "in", self.ids),
+                    ("partner_id", "=", partner_id),
+                    ("identification_number", "=", identification_number),
+                ]
+            )
+        )
+        existing_slides = slide_partners.slide_id
+        for slide_partner in slide_partners:
+            expected_vote = 1 if upvote else -1
+            slide_partner.vote = (
+                0 if slide_partner.vote == expected_vote else expected_vote
+            )
+        new_vote = 1 if upvote else -1
+        self.env["slide.slide.partner"].sudo().create(
+            [
+                {
+                    "slide_id": slide.id,
+                    "channel_id": slide.channel_id.id,
+                    "partner_id": partner_id,
+                    "identification_number": identification_number,
+                    "vote": new_vote,
+                }
+                for slide in self - existing_slides
+            ]
+        )
 
     def _action_set_viewed(self, target_partner, quiz_attempts_inc=False):
         if self._is_public_with_key():
@@ -123,49 +145,66 @@ class SlideSlide(models.Model):
         )
 
     def _action_mark_completed(self):
-        if self._is_public_with_key():
-            invite_partner_id = request.session.get("invite_partner_id")
-            identification_number = request.session.get("identification_number")
-            self_sudo = self.sudo()
-            SlidePartnerSudo = self.env["slide.slide.partner"].sudo()
-            existing_sudo = SlidePartnerSudo.search(
+        if not self._is_public_with_key():
+            return super()._action_mark_completed()
+        uncompleted_slides = self.filtered(lambda slide: not slide.user_has_completed)
+        uncompleted_slides._action_set_quiz_done()
+        partner_id = int(request.session["invite_partner_id"])
+        identification_number = request.session["identification_number"]
+        slide_partners = (
+            self.env["slide.slide.partner"]
+            .sudo()
+            .search(
                 [
-                    ("slide_id", "in", self.ids),
-                    ("partner_id", "=", int(invite_partner_id)),
-                    (
-                        "identification_number",
-                        "=",
-                        identification_number,
-                    ),
+                    ("slide_id", "in", uncompleted_slides.ids),
+                    ("partner_id", "=", partner_id),
+                    ("identification_number", "=", identification_number),
                 ]
             )
-            existing_sudo.write({"completed": True})
-            new_slides = self_sudo - existing_sudo.mapped("slide_id")
-            SlidePartnerSudo.create(
-                [
-                    {
-                        "slide_id": new_slide.id,
-                        "channel_id": new_slide.channel_id.id,
-                        "partner_id": int(invite_partner_id),
-                        "vote": 0,
-                        "completed": True,
-                        "identification_number": identification_number,
-                    }
-                    for new_slide in new_slides
-                ]
-            )
-            return True
-        return super()._action_mark_completed()
+        )
+        slide_partners.write({"completed": True})
+        existing_slides = slide_partners.slide_id
+        self.env["slide.slide.partner"].sudo().create(
+            [
+                {
+                    "slide_id": slide.id,
+                    "channel_id": slide.channel_id.id,
+                    "partner_id": partner_id,
+                    "identification_number": identification_number,
+                    "vote": 0,
+                    "completed": True,
+                }
+                for slide in uncompleted_slides - existing_slides
+            ]
+        )
+        return True
+
+    def action_mark_uncompleted(self):
+        if not self._is_public_with_key():
+            return super().action_mark_uncompleted()
+        completed_slides = self.filtered(lambda slide: slide.user_has_completed)
+        completed_slides._action_set_quiz_done(completed=False)
+        self.env["slide.slide.partner"].sudo().search(
+            [
+                ("slide_id", "in", completed_slides.ids),
+                (
+                    "partner_id",
+                    "=",
+                    int(request.session["invite_partner_id"]),
+                ),
+                (
+                    "identification_number",
+                    "=",
+                    request.session["identification_number"],
+                ),
+            ]
+        ).write({"completed": False})
+        return True
 
     def _action_set_quiz_done(self, completed=True):
-        points_before = self.env.user.karma
-        res = super()._action_set_quiz_done(completed=completed)
-        # If the user is public with password, resets the points to the previous value.
-        if self.env.user._is_public() and any(
-            slide.user_membership_id.identification_number for slide in self
-        ):
-            self.env.user.sudo().write({"karma": points_before})
-        return res
+        if self._is_public_with_key():
+            return True
+        return super()._action_set_quiz_done(completed=completed)
 
     def _compute_quiz_info(self, target_partner, quiz_done=False):
         result = super()._compute_quiz_info(target_partner, quiz_done=quiz_done)
@@ -230,12 +269,52 @@ class SlideSlide(models.Model):
                         )
         return result
 
-    def _apply_ir_rules(self, query, mode="read"):
-        if self._is_public_with_key():
-            return
-        return super()._apply_ir_rules(query, mode="read")
+    @api.model
+    def _search(
+        self,
+        domain,
+        offset=0,
+        limit=None,
+        order=None,
+        bypass_access=False,
+        **kwargs,
+    ):
+        participations = self.env["slide.channel"]._get_public_key_participations()
+        if participations:
+            public_domain = (
+                Domain("channel_id.website_published", "=", True)
+                & Domain("website_published", "=", True)
+                & (
+                    (
+                        Domain(
+                            "channel_id.visibility",
+                            "in",
+                            ["public", "link"],
+                        )
+                        & (
+                            Domain("is_category", "=", True)
+                            | Domain("is_preview", "=", True)
+                        )
+                    )
+                    | Domain(
+                        "channel_id",
+                        "in",
+                        participations.channel_id.ids,
+                    )
+                )
+            )
+            domain = Domain(domain) & public_domain
+            bypass_access = True
+        return super()._search(
+            domain,
+            offset=offset,
+            limit=limit,
+            order=order,
+            bypass_access=bypass_access,
+            **kwargs,
+        )
 
-    def check_access_rule(self, operation):
-        if self._is_public_with_key():
-            return
-        return super().check_access_rule(operation)
+    def _check_access(self, operation):
+        if operation == "read" and self._is_public_with_key():
+            return None
+        return super()._check_access(operation)
