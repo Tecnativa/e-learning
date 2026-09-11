@@ -14,12 +14,8 @@ class WebsiteSlidesSurvey(WebsiteSlidesSurvey):
         website=True,
     )
     def slide_get_certification_url(self, slide_id, **kw):
-        invite_hash = request.session.get("invite_hash", False)
-        identification_number = (request.session.get("identification_number", False),)
-        invite_partner_id = request.session.get("invite_partner_id", False)
+        slide = request.env["slide.slide"].browse(int(slide_id))
         res = super().slide_get_certification_url(slide_id=slide_id, **kw)
-        if request.env.user._is_public() and not (
-            identification_number and invite_partner_id and invite_hash
-        ):
+        if request.env.user._is_public() and not slide.channel_id._has_key_session():
             return request.redirect("/web/login")
         return res
