@@ -230,7 +230,10 @@ class SlideChannelPartner(models.Model):
         return super().create(vals_list)
 
     def _recompute_completion(self):
-        slide_channel_partners = self.filtered(lambda scp: scp.identification_number)
+        slide_channel_partners = self.filtered(
+            lambda scp: scp.identification_number
+            and scp.is_public_slide_channel_partner
+        )
         if not slide_channel_partners:
             return super()._recompute_completion()
         read_group_res = (
