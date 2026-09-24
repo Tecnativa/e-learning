@@ -198,14 +198,17 @@ class SlideChannelPartner(models.Model):
                 rec.used_registrations or 0
             )
 
-    @api.depends("child_channel_partner_ids")
+    @api.depends(
+        "child_channel_partner_ids",
+        "sale_order_line_ids",
+        "available_registrations",
+    )
     def _compute_used_registrations(self):
         for record in self:
-            record.used_registrations = (
-                len(record.child_channel_partner_ids)
-                if record.sale_order_line_ids
-                else 1
-            )
+            if not record.sale_order_line_ids or record.available_registrations == 1:
+                record.used_registrations = 1
+            else:
+                record.used_registrations = len(record.child_channel_partner_ids)
 
     @api.depends("channel_id", "partner_id")
     def _compute_invitation_link(self):
